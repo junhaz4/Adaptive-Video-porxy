@@ -1,0 +1,168 @@
+#!/usr/bin/env python3.10
+import sys
+from socket import *
+import threading
+import time
+import re
+import xml.etree.ElementTree as ET
+
+# a listen socket that keeps listening
+# proxy receives requests of chunk from browser
+# proxy get bitrates from .mpd file and use throughput to replace the bitrate in the request header
+# foward modifed request to server and get response chunks
+# proxy receives response chunks from server and modify .mpd to ._nolist.mpd and forwad to browser 
+
+
+# input arguments
+log_path,alpha,listen_port,fake_ip,web_server_ip=sys.argv[1],float(sys.argv[2]),int(sys.argv[3]),sys.argv[4],sys.argv[5]
+listen_ip = ""
+server_port = 8080
+buffer_size = 4096
+t_dict = {}
+
+def main():
+  # start the listen socket
+  listenSocket = socket(AF_INET, SOCK_STREAM)
+  listenSocket.bind((listen_ip,listen_port))
+  listenSocket.listen(100)
+  while True:
+    # connect with browser 
+    browserSocket, addr = listenSocket.accept()
+    # multithreading for concurrent connections
+    browserThread = threading.Thread(target=proxy_handle,args=(browserSocket,addr))
+    browserThread.start()
+  
+def proxy_handle(connectSocket,addr):
+  global t_dict
+  # connect with server
+  serverSocket = socket(AF_INET, SOCK_STREAM)
+  serverSocket.bind((fake_ip,0))
+  serverSocket.connect((web_server_ip,server_port))
+  # initialize the current throughput
+  t_current = None
+  client_ip = addr[0]
+  # if it's a reconnection, fetch the previous throughput
+  if (client_ip,web_server_ip) in t_dict.keys():
+    t_current = t_dict[(client_ip,web_server_ip)]
+  while True:
+    # receive request from browser
+    request = connectSocket.recv(buffer_size)
+    # start the timer
+    t_start = time.time()
+    # Deal with three types of files: .mpd, .m4s, others
+    # change .mpd to ._nolist.mpd and get all bitrates
+    if b'.mpd' in request:
+      request_split = request.split(b'\r\n')
+      # replace the file
+      request_split[0] = request_split[0].replace(b'.mpd', b'_nolist.mpd')
+      modified_request = b'\r\n'.join(request_split)
+      serverSocket.send(request)
+      # get manifest file
+      manifest_response = serverSocket.recv(buffer_size)
+      bitrates = get_bitrates(manifest_response)
+    # for video files, calculate throughput, bitrate for video chunks and update the url according to bitrate
+    if b'.m4s' in request: 
+      # modify chunk name based on bitrate and throughput
+      if t_current == None:
+        t_current = min(bitrates)
+      # get appropriate bitrate 
+      chosen_bitrate = change_bitrates(bitrates,t_current)
+      # change request url based on bitrate
+      modified_request = re.sub(b"_[0-9]+", bytes("_"+str(chosen_bitrate), encoding='utf-8'), request, 1)
+      # get chunk name
+      chunk_name = (re.findall(b"/.+m4s", modified_request))[0]
+      # send request and receive response
+      serverSocket.send(modified_request)
+      content_length = receive_and_send(serverSocket,connectSocket)
+      # get chunk size in bits
+      chunk_size = content_length*8
+      # end timer
+      t_end = time.time()
+      # update througput
+      t_current,t_new = calculate_EMEA(alpha,chunk_size,t_start,t_end,t_current)
+      # write to log
+      write_log(time.time(),t_end-t_start,t_new/1000,t_current/1000,1+chosen_bitrate//1000,web_server_ip,chunk_name)
+      # store throughput 
+      t_dict[(client_ip,web_server_ip)] = t_current
+    else:
+      # just forward other type of files
+      serverSocket.send(request)
+      response = serverSocket.recv(buffer_size)
+      connectSocket.send(response)
+
+def calculate_EMEA(alpha,chunk_size, t_start, t_end, t_current):
+  # calculate new throughput 
+  t_new =  chunk_size/(t_end-t_start)
+  t_current = alpha*t_new+(1-alpha)*t_current
+  return t_current, t_new
+  
+
+def receive_and_send(serverSocket,connectSocket):
+  # receive all video chunks and send to client
+  while True:
+    try:
+      data = serverSocket.recv(buffer_size)
+      connectSocket.send(data)
+      # check if data is header
+      if b'Content-Length' in data:
+        # this means the current data received is header
+        header = data
+        # extract content length from header
+        content_length = get_content_length(header)
+        # remain represents how many contents need to be received
+        remain = content_length
+        # get video content length
+        body = data.split(b'\r\n\r\n')[1]
+        # subtract length of body until receive all video chunk contents
+        remain -= len(body)
+      else:
+        remain -= len(data)
+      # all video chunk contents all received, break
+      if remain <= 0:
+        break
+    except:
+      pass
+  return content_length
+  
+
+def get_content_length(header):
+  # parse header to get content length
+  content_length = re.findall(b"Content-Length: [0-9]+", header)
+  content_length = re.findall(b"[0-9]+", content_length[0])
+  content_length = content_length[0].decode()
+  return int(content_length)
+
+
+def get_bitrates(manifest):
+  # parse manifest to get all possible bitrates
+  bitrates = []
+  manifest_list = (manifest.decode()).split('\r\n\r\n')
+  root = ET.fromstring(manifest_list[1])
+  for ele in root.iter():
+    if "Representation" in ele.tag:
+      bitrates.append(int(ele.attrib.get('bandwidth')))
+  return bitrates
+
+def change_bitrates(bitrates,t_current):
+  # change bitrates based on throughput
+  new_rate = min(bitrates)
+  for rate in bitrates:
+    if t_current >= 1.5*rate:
+      new_rate = rate
+    else:
+      break
+  return new_rate
+
+def write_log(time,duration,tput,avg_tput,bitrate,server_ip,chunk_name):
+  # store information to a file
+  contents = ''
+  contents += str(time) + " " + str(duration) + " " + str(tput) + " " + str(avg_tput) + " " + str(bitrate) + " " + str(server_ip) + " " + str(chunk_name)
+  file = open(log_path,'a')
+  file.write(contents)
+  file.write('\n')
+  file.close()
+  
+if __name__ == "__main__":
+  main()
+
+
