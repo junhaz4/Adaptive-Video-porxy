@@ -1,7 +1,7 @@
 # Adaptive-Video-porxy
 
-• Developed an adaptive video proxy in Python and Socket to efficiently stream video content over network connections
+This adaptive video proxy in written in Python and Socket to efficiently stream video content over various of network connections
 
-• Utilized ABR algorithm to dynamically choose the best bitrate and achieved adaptive bitrate streaming functionality
+ABR algorithm is used to dynamically choose the best bitrate and achieved adaptive bitrate streaming functionality
 
-• Accomplished multithreading to allow proxy to accept multiple concurrent connections from web browsers
+Multithreading is achieved to allow proxy to accept multiple concurrent connections from web browsers
